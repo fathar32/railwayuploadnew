@@ -80,7 +80,7 @@ app.post("/upload-csv", upload.single("file"), async (req, res) => {
     // Insert
     for (const row of validatedRows) {
       const cols = Object.keys(row);
-      const values = Object.values(row);
+      const values = Object.values(row).map(v => v === "" ? null : v);
 
       const placeholders = values.map((_, i) => `$${i+1}`).join(",");
 
