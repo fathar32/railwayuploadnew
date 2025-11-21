@@ -1,100 +1,102 @@
-const express = require('express');
-const multer = require('multer');
-const csvParser = require('csv-parser');
-const { Pool } = require('pg');
-const stream = require('stream');
-const cors = require('cors');
+import express from "express";
+import multer from "multer";
+import { Pool } from "pg";
+import Papa from "papaparse";
+import { z } from "zod";
 
+const upload = multer();
 const app = express();
-app.use(cors());
-app.use(express.json());
 
-const upload = multer({ storage: multer.memoryStorage() });
-
-const DATABASE_URL = process.env.DATABASE_URL;
-if (!DATABASE_URL) {
-  console.error('ERROR: DATABASE_URL environment variable missing.');
-  process.exit(1);
-}
-
-const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
-
-async function ensureTable() {
-  const createSql = `
-    CREATE TABLE IF NOT EXISTS csv_uploads (
-      id BIGSERIAL PRIMARY KEY,
-      uploaded_at TIMESTAMPTZ DEFAULT now(),
-      data JSONB
-    );
-  `;
-  await pool.query(createSql);
-}
-
-app.get('/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ ok: false });
-  }
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
-app.post('/upload-csv', upload.single('file'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'Missing file field (file)' });
+const TABLE_NAME = "berkas_verifikasi"; // <-- pakai tabel ini selalu
 
+// validasi CSV pakai Zod
+const CSVSchema = z.object({
+  nomor_surat: z.string(),
+  nama_pegawai: z.string(),
+  nip: z.string(),
+  status_verifikasi: z.string(),
+  created_at: z.string(),
+  jabatan: z.string(),
+  perihal: z.string(),
+});
+
+async function tableExists() {
+  const res = await pool.query(
+    `SELECT to_regclass('public.${TABLE_NAME}') AS exists;`
+  );
+  return res.rows[0].exists !== null;
+}
+
+async function getTableColumns() {
+  const res = await pool.query(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_name = '${TABLE_NAME}';`
+  );
+  return res.rows.map(r => r.column_name);
+}
+
+async function createTableIfNotExists() {
+  const exists = await tableExists();
+  if (exists) return;
+
+  await pool.query(`
+    CREATE TABLE ${TABLE_NAME} (
+      nomor_surat TEXT,
+      nama_pegawai TEXT,
+      nip TEXT,
+      status_verifikasi TEXT,
+      created_at TEXT,
+      jabatan TEXT,
+      perihal TEXT
+    );
+  `);
+}
+
+app.post("/upload-csv", upload.single("file"), async (req, res) => {
   try {
-    await ensureTable();
+    if (!req.file) return res.status(400).json({ error: "Tidak ada file CSV" });
 
-    const rows = [];
-    const bufferStream = new stream.PassThrough();
-    bufferStream.end(req.file.buffer);
+    const csvText = req.file.buffer.toString("utf-8");
 
-    await new Promise((resolve, reject) => {
-      bufferStream
-        .pipe(csvParser())
-        .on('data', (data) => rows.push(data))
-        .on('end', resolve)
-        .on('error', reject);
+    const { data } = Papa.parse(csvText, {
+      header: true,
+      skipEmptyLines: true
     });
 
-    if (rows.length === 0) return res.status(400).json({ error: 'CSV kosong atau tidak valid' });
-
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const values = [];
-      const params = [];
-      let idx = 1;
-
-      for (const row of rows) {
-        params.push(`$${idx++}`);
-        values.push(JSON.stringify(row));
-      }
-
-      const insertSql = `INSERT INTO csv_uploads (data) VALUES ${params.map(p => `(${p}::jsonb)`).join(',')}`;
-      await client.query(insertSql, values);
-      await client.query('COMMIT');
-    } catch (e) {
-      await client.query('ROLLBACK');
-      throw e;
-    } finally {
-      client.release();
+    // Validasi tiap baris
+    const validatedRows = [];
+    for (const row of data) {
+      validatedRows.push(CSVSchema.parse(row));
     }
 
-    res.json({ ok: true, rows_inserted: rows.length, message: `Upload berhasil! ${rows.length} baris disimpan.` });
+    // Buat table jika belum ada
+    await createTableIfNotExists();
+
+    // Insert
+    for (const row of validatedRows) {
+      const cols = Object.keys(row);
+      const values = Object.values(row);
+
+      const placeholders = values.map((_, i) => `$${i+1}`).join(",");
+
+      await pool.query(
+        `INSERT INTO ${TABLE_NAME}(${cols.join(",")})
+         VALUES (${placeholders})`,
+        values
+      );
+    }
+
+    return res.json({ message: "CSV berhasil diupload & ditambahkan ke tabel!" });
+
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error(err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/uploads', async (req, res) => {
-  try {
-    const { rows } = await pool.query('SELECT id, uploaded_at, data FROM csv_uploads ORDER BY uploaded_at DESC LIMIT 50');
-    res.json(rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Server berjalan di port ${PORT}`));
+app.listen(8080, () => console.log("Server berjalan di port 8080"));
